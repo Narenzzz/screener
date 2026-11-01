@@ -6,11 +6,11 @@ import math
 st.set_page_config(page_title="Institutional Batch Stock Screener & Valuation Vault", layout="wide")
 
 st.title("🛡️ Institutional Batch Stock Screener & Valuation Vault")
-st.markdown("Upload your fundamental CSV export (e.g., from Screener.in) to instantly batch-apply Moat grading, Reverse DCF implied growth ($g_1$), staggered buy-zones, and institutional exit playbooks across your entire stock universe.")
+st.markdown("Upload your raw fundamental CSV export straight from Screener.in to instantly batch-apply Moat grading, Reverse DCF implied growth ($g_1$), staggered buy-zones, and institutional screening rules across your entire stock universe.")
 
 # --- SIDEBAR: CONFIGURATION & UPLOAD ---
 st.sidebar.header("1. Upload Stock Universe CSV")
-uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+uploaded_file = st.sidebar.file_uploader("Upload CSV (Screener.in Export)", type=["csv"])
 
 st.sidebar.header("2. Global Assumptions")
 default_wacc = st.sidebar.slider("Assumed WACC (r %)", 8.0, 18.0, 12.0, 0.5)
@@ -66,11 +66,9 @@ def solve_reverse_dcf(cmp, fcf_0, wacc, term_g, shares):
     return round(max(-20.0, min(80.0, best_g)), 2)
 
 def compute_buy_zones(cmp, dcf_iv, graham_val, moat_grade):
-    # Anchor price calculation
     valid_vals = [v for v in [dcf_iv, graham_val] if v and v > 0]
     anchor = np.median(valid_vals) if valid_vals else cmp
     
-    discount_multiplier = 0.85 if moat_grade in ["A+", "A"] else 0.75
     sip_zone = (anchor * 0.75, anchor * 0.90)
     garp_zone = (anchor * 0.90, anchor * 1.10)
     deep_value = (0.0, anchor * 0.75)
@@ -84,24 +82,19 @@ def compute_buy_zones(cmp, dcf_iv, graham_val, moat_grade):
 if uploaded_file is not None:
     df = pd.read_csv(uploaded_file)
     
-    # Standardize column naming check (handles common screener exports)
-    # Expected columns or mapping fallback
-    col_map = {c.lower(): c for c in df.columns}
-    
-    required_cols = ["ticker", "name", "cmp", "roce", "roe", "debt_equity", "fcf", "eps", "shares"]
-    
-    # Process each row
     results = []
     for idx, row in df.iterrows():
-        # Fallback helpers
-        ticker = str(row.get("Ticker", row.get("Symbol", f"STOCK_{idx}")))
-        name = str(row.get("Name", row.get("Company", ticker)))
+        # Handle Screener.in default export formatting (extracting identifier from Name)
+        name = str(row.get("Name", row.get("Company", f"STOCK_{idx}")))
+        ticker = name.split(" Ltd")[0].split(" Limited")[0].strip().upper()
+        
+        # Safe numerical parsing with multiple fallbacks for Screener headers
         cmp = float(row.get("CMP", row.get("Current Price", row.get("Price", 100.0))))
         roce = float(row.get("ROCE", row.get("Return on Capital Employed", 15.0)))
         roe = float(row.get("ROE", row.get("Return on Equity", 12.0)))
-        de = float(row.get("Debt_Equity", row.get("Debt to Equity", 0.2)))
-        fcf = float(row.get("FCF", row.get("Free Cash Flow", row.get("Net Income", 1000.0))))
-        shares = float(row.get("Shares", row.get("No. of Equity Shares", row.get("Shares Outstanding", 10.0))))
+        de = float(row.get("Debt to equity", row.get("Debt_Equity", row.get("Debt to Equity", 0.2))))
+        fcf = float(row.get("Free Cash Flow", row.get("FCF", row.get("Net Income", 1000.0))))
+        shares = float(row.get("No. of Equity Shares", row.get("Shares", row.get("Shares Outstanding", 10.0))))
         eps = float(row.get("EPS", row.get("Earnings Per Share", 10.0)))
         
         # 1. Moat Grade
@@ -128,13 +121,13 @@ if uploaded_file is not None:
             
         results.append({
             "Ticker": ticker,
-            "Company": name,
+            "Company Name": name,
             "Moat Grade": moat,
             "CMP (₹)": round(cmp, 2),
             "ROCE (%)": round(roce, 2),
             "ROE (%)": round(roe, 2),
             "Debt/Equity": round(de, 2),
-            "Implied Growth ($g_1$ %)": implied_g1,
+            "Implied Growth (g₁ %)": implied_g1,
             "Valuation Anchor (₹)": round(anchor, 2),
             "SIP Zone Start (₹)": round(sip_z[0], 2),
             "SIP Zone End (₹)": round(sip_z[1], 2),
@@ -159,7 +152,7 @@ if uploaded_file is not None:
     col3.metric("A+ Moat Count", len(res_df[res_df["Moat Grade"] == "A+"]))
     col4.metric("In Buy Zone", len(filtered_df[filtered_df["In Active Buy Zone"] == "✅ Yes"]))
     
-    # Styled Dataframe
+    # Styled Dataframe presentation
     st.dataframe(filtered_df, use_container_width=True, hide_index=True)
     
     # Download Button
@@ -172,7 +165,17 @@ if uploaded_file is not None:
     )
 
 else:
-    st.info("👈 Please upload your stock universe CSV file in the sidebar to begin batch-screening.")
+    st.info("👈 Please upload your Screener.in CSV file in the sidebar to begin batch-screening.")
     
-    with st.expander("📌 View Required CSV Format Guidelines"):
-        st.markdown(""" Your uploaded CSV file should ideally contain the following columns (case-insensitive): * `Ticker` or `Symbol` (e.g., `RELIANCE`, `TCS`) * `Name` or `Company` (e.g., `Reliance Industries Ltd`) * `CMP` or `Current Price` (Current market price in ₹) * `ROCE` (%) * `ROE` (%) * `Debt_Equity` (Debt to Equity ratio) * `FCF` or `Net Income` (Free cash flow in ₹) * `EPS` (Earnings per share) * `Shares` (Total shares outstanding in crores or absolute units) """)
+    with st.expander("📌 View Screener.in Column Recommendations"):
+        st.markdown("""
+        When exporting your screen from **Screener.in**, make sure your table includes columns matching:
+        * `Name` (Company Name)
+        * `Current Price` or `CMP`
+        * `ROCE` (%)
+        * `ROE` (%)
+        * `Debt to equity`
+        * `Free Cash Flow` (or Net Income)
+        * `No. of Equity Shares`
+        * `EPS`
+        """)
