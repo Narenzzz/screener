@@ -4,10 +4,10 @@ import numpy as np
 import math
 import yfinance as yf
 
-st.set_page_config(page_title="Institutional All-in-One Nifty 500 Screener", layout="wide")
+st.set_page_config(page_title="Institutional All-in-One Nifty Screener", layout="wide")
 
-st.title("🛡️ Institutional All-in-One Nifty 500 Screener & Valuation Engine")
-st.markdown("Upload a plain text or CSV file containing your ticker symbols (e.g., `RELIANCE`, `TCS`). The app will fetch live fundamentals, compute Moat grades, run Reverse DCF $g_1$ valuations, and categorize your stocks into GARP & Quality buckets instantly.")
+st.title("🛡️ Institutional All-in-One Stock Screener & Valuation Engine")
+st.markdown("Upload a text or CSV file of ticker symbols (e.g. `RELIANCE`, `TCS`). The app will fetch live fundamentals, compute Moat grades, extract sectors/industries, calculate Graham, DCF, and P/E intrinsic values, and evaluate your GARP & quality filters.")
 
 # --- SIDEBAR: CONTROLS & UPLOAD ---
 st.sidebar.header("1. Upload Ticker List")
@@ -17,9 +17,11 @@ st.sidebar.header("2. Global Valuation Assumptions")
 default_wacc = st.sidebar.slider("Assumed WACC (r %)", 8.0, 18.0, 12.0, 0.5)
 default_term_g = st.sidebar.slider("Terminal Growth Rate ($g_{term}$ %)", 2.0, 6.0, 4.0, 0.25)
 
-st.sidebar.header("3. Institutional Filters")
+st.sidebar.header("3. Institutional & Valuation Filters")
 min_roce = st.sidebar.slider("Min ROCE (%)", 0.0, 50.0, 15.0, 1.0)
 max_de = st.sidebar.slider("Max Debt-to-Equity", 0.0, 2.0, 0.5, 0.1)
+max_pe = st.sidebar.slider("Max Trailing P/E", 5.0, 100.0, 35.0, 1.0)
+max_peg = st.sidebar.slider("Max PEG Ratio", 0.1, 5.0, 2.5, 0.1)
 selected_moats = st.sidebar.multiselect("Filter Moat Grades", ["A+", "A", "B", "C", "D"], default=["A+", "A", "B"])
 
 # --- CORE INSTITUTIONAL LOGIC FUNCTIONS ---
@@ -81,10 +83,8 @@ def compute_buy_zones(cmp, dcf_iv, graham_val, moat_grade):
 
 # --- EXECUTION FLOW ---
 if ticker_file is not None:
-    # Read tickers from uploaded text or csv file
     if ticker_file.name.endswith('.csv'):
         temp_df = pd.read_csv(ticker_file)
-        # Try finding a column with ticker names
         col_cand = [c for c in temp_df.columns if 'ticker' in c.lower() or 'symbol' in c.lower() or 'name' in c.lower()]
         raw_tickers = temp_df[col_cand[0]].dropna().tolist() if col_cand else temp_df.iloc[:, 0].dropna().tolist()
     else:
@@ -113,28 +113,58 @@ if ticker_file is not None:
                 info = stock.info
                 
                 name = info.get("longName", clean_t.replace(".NS", ""))
+                sector = info.get("sector", "N/A")
+                industry = info.get("industry", "N/A")
+                
                 cmp = info.get("currentPrice") or info.get("regularMarketPrice") or 0.0
                 eps = info.get("trailingEps", 0.0)
+                pe = info.get("trailingPE", 0.0) or 0.0
+                peg = info.get("pegRatio", 0.0) or 0.0
                 shares = info.get("sharesOutstanding", 0.0)
                 
                 if cmp == 0 or shares == 0:
                     continue
                 
-                total_cash = info.get("totalCash", 0.0)
-                total_debt = info.get("totalDebt", 0.0)
-                total_equity = info.get("bookValue", 1.0) * shares
-                de_ratio = (total_debt / total_equity) if total_equity > 0 else 0.2
+                # Robust financial extractions
+                total_cash = info.get("totalCash", 0.0) or 0.0
+                total_debt = info.get("totalDebt", 0.0) or 0.0
+                net_income = info.get("netIncomeToCommon", 0.0) or 0.0
+                ebit = info.get("ebit", 0.0) or (net_income * 1.4)
                 
-                roce = (info.get("returnOnCapitalEmployed", 0.15) or 0.15) * 100.0
-                roe = (info.get("returnOnEquity", 0.12) or 0.12) * 100.0
-                fcf = info.get("freeCashflow") or (info.get("netIncomeToCommon", 1000000.0) * 0.6)
+                book_value_per_share = info.get("bookValue", 0.0) or 0.0
+                total_equity = book_value_per_share * shares if book_value_per_share > 0 else max(1.0, net_income * 5)
                 
-                # Apply Institutional Logic
+                capital_employed = total_equity + total_debt - total_cash
+                if capital_employed <= 0:
+                    capital_employed = total_equity * 1.2
+
+                calculated_roce = (ebit / capital_employed) * 100.0 if capital_employed > 0 else 5.0
+                calculated_roe = (net_income / total_equity) * 100.0 if total_equity > 0 else 5.0
+                de_ratio = (total_debt / total_equity) if total_equity > 0 else 0.5
+                
+                roce = round(max(-50.0, min(100.0, calculated_roce)), 2)
+                roe = round(max(-50.0, min(100.0, calculated_roe)), 2)
+                fcf = info.get("freeCashflow") or (net_income * 0.6)
+                
+                # 1. Moat Grade
                 moat = calculate_moat_grade(roce, roe, de_ratio)
+                
+                # 2. Reverse DCF Implied Growth
                 implied_g1 = solve_reverse_dcf(cmp, fcf, default_wacc / 100.0, default_term_g / 100.0, shares)
                 
+                # 3. Multi-Model Intrinsic Values
+                # Graham Formula Value: sqrt(22.5 * EPS * BVPS) or sqrt(22.5 * EPS * EPS * 1.1)
+                graham_val = math.sqrt(max(0.0, 22.5 * max(0.0, eps) * max(0.0, book_value_per_share if book_value_per_share > 0 else eps))) if eps > 0 else cmp
+                
+                # DCF Proxy Intrinsic Value
                 dcf_iv = max(cmp * 0.8, eps * 15 * (1 + implied_g1/100))
-                graham_val = math.sqrt(22.5 * max(1.0, eps) * max(1.0, eps * 1.1)) if eps > 0 else cmp
+                
+                # P/E Based Intrinsic Value (Assuming normalized sector baseline P/E of 18x)
+                pe_iv = max(0.0, eps * 18.0) if eps > 0 else cmp
+                
+                # Blended Intrinsic Value
+                valid_ivs = [v for v in [graham_val, dcf_iv, pe_iv] if v > 0]
+                blended_iv = np.mean(valid_ivs) if valid_ivs else cmp
                 
                 anchor, sip_z, garp_z, is_in_zone = compute_buy_zones(cmp, dcf_iv, graham_val, moat)
                 
@@ -150,15 +180,21 @@ if ticker_file is not None:
                 results.append({
                     "Ticker": clean_t.replace(".NS", ""),
                     "Company Name": name,
+                    "Sector": sector,
+                    "Industry": industry,
                     "Moat Grade": moat,
                     "CMP (₹)": round(cmp, 2),
-                    "ROCE (%)": round(roce, 2),
-                    "ROE (%)": round(roe, 2),
+                    "Trailing P/E": round(pe, 2),
+                    "PEG Ratio": round(peg, 2),
+                    "ROCE (%)": roce,
+                    "ROE (%)": roe,
                     "Debt/Equity": round(de_ratio, 2),
+                    "Graham IV (₹)": round(graham_val, 2),
+                    "DCF IV (₹)": round(dcf_iv, 2),
+                    "P/E IV (₹)": round(pe_iv, 2),
+                    "Blended IV (₹)": round(blended_iv, 2),
                     "Implied Growth (g₁ %)": implied_g1,
                     "Valuation Anchor (₹)": round(anchor, 2),
-                    "SIP Zone Start (₹)": round(sip_z[0], 2),
-                    "SIP Zone End (₹)": round(sip_z[1], 2),
                     "In Active Buy Zone": "✅ Yes" if is_in_zone else "❌ No",
                     "Institutional Verdict": verdict
                 })
@@ -170,9 +206,6 @@ if ticker_file is not None:
         if results:
             res_df = pd.DataFrame(results)
             st.session_state["screened_df"] = res_df
-        else:
-        # Fallback safeguard if live fetch returns empty dictionary elements
-            st.warning("No data retrieved. Please check your symbols.")
 
     # Display results if available in session state
     if "screened_df" in st.session_state:
@@ -181,6 +214,8 @@ if ticker_file is not None:
         filtered_df = res_df[
             (res_df["ROCE (%)"] >= min_roce) &
             (res_df["Debt/Equity"] <= max_de) &
+            (res_df["Trailing P/E"] <= max_pe) &
+            ((res_df["PEG Ratio"] <= max_peg) | (res_df["PEG Ratio"] == 0.0)) &
             (res_df["Moat Grade"].isin(selected_moats))
         ]
         
@@ -192,7 +227,16 @@ if ticker_file is not None:
         col3.metric("A+ Moat Count", len(res_df[res_df["Moat Grade"] == "A+"]))
         col4.metric("In Buy Zone", len(filtered_df[filtered_df["In Active Buy Zone"] == "✅ Yes"]))
         
-        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+        # Configure column configuration with frozen columns for Ticker and Company Name
+        st.dataframe(
+            filtered_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Ticker": st.column_config.TextColumn("Ticker", pinned=True),
+                "Company Name": st.column_config.TextColumn("Company Name", pinned=True),
+            }
+        )
         
         csv_bytes = filtered_df.to_csv(index=False).encode('utf-8')
         st.download_button(
@@ -215,5 +259,5 @@ else:
         HDFCBANK
         ICICIBANK
         ```
-        The app will automatically append `.NS`, pull live metrics, grade their moats, run Reverse DCF, and filter them based on your settings!
+        The app will automatically append `.NS`, pull live metrics, determine sectors/industries, evaluate moat grades, compute multiple intrinsic values (Graham, DCF, P/E), and filter them based on your settings!
         """)
