@@ -2,12 +2,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
+import time
+import re
+import requests
+from bs4 import BeautifulSoup
 import yfinance as yf
 
 st.set_page_config(page_title="Institutional All-in-One Nifty Screener", layout="wide")
 
 st.title("🛡️ Institutional All-in-One Stock Screener & Valuation Engine")
-st.markdown("Upload your NSE ticker list (`.txt` or `.csv`). This engine extracts true audited Balance Sheet, Income Statement, and Cash Flow line items to compute exact ROCE, ROE, Moat grades, and Multi-Model Intrinsic Values.")
+st.markdown("Upload your NSE ticker list (`.txt` or `.csv`). This engine extracts audited financial statements for exact ROCE/ROE, Multi-Model Intrinsic Values (Graham, DCF, P/E), and **5-Quarter Shareholding Trends (Promoter, Institutional, Retail)**.")
 
 # --- SIDEBAR: CONTROLS & UPLOAD ---
 st.sidebar.header("1. Upload Ticker List")
@@ -35,6 +39,107 @@ def get_statement_value(df, possible_keys, default=0.0):
             if not val.empty:
                 return float(val.iloc[0])
     return default
+
+# --- HELPER: 5-QUARTER SHAREHOLDING TREND EXTRACTOR ---
+def classify_5q_trend(series_vals, threshold=0.25):
+    """
+    Compares the last 5 quarters (oldest to latest).
+    threshold = 0.25% (25 bps) change over 5 quarters to distinguish Rising/Decline from Flat.
+    """
+    if not series_vals or len(series_vals) < 2:
+        return "N/A"
+    window = series_vals[-5:] if len(series_vals) >= 5 else series_vals
+    start_val = window[0]
+    end_val = window[-1]
+    diff = round(end_val - start_val, 2)
+    
+    if diff > threshold:
+        return f"📈 Rising ({end_val:.1f}% | +{diff:.2f}%)"
+    elif diff < -threshold:
+        return f"📉 Decline ({end_val:.1f}% | {diff:.2f}%)"
+    else:
+        return f"➖ Flat ({end_val:.1f}% | {diff:+.2f}%)"
+
+def fetch_5q_shareholding_trends(nse_symbol, yf_info=None):
+    """
+    Scrapes the last 5 quarters of SEBI Shareholding Pattern (Promoters, FII+DII Institutions, Public/Retail)
+    from Screener.in public company page, with fallback to yfinance current snapshot if unavailable.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    
+    for mode in ["consolidated/", ""]:
+        url = f"https://www.screener.in/company/{nse_symbol}/{mode}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=6)
+            if resp.status_code != 200:
+                continue
+            soup = BeautifulSoup(resp.text, "lxml")
+            sh_sec = soup.find("section", id="shareholding")
+            if not sh_sec:
+                continue
+            table = sh_sec.find("table", class_="data-table")
+            if not table:
+                continue
+                
+            promoters, fiis, diis, public = [], [], [], []
+            for tr in table.find_all("tr"):
+                cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if not cells or len(cells) < 3:
+                    continue
+                row_title = re.sub(r'[\+\-\s]+$', '', cells[0]).strip().lower()
+                
+                nums = []
+                for c in cells[1:]:
+                    c_clean = c.replace('%', '').replace(',', '').strip()
+                    try:
+                        nums.append(float(c_clean))
+                    except ValueError:
+                        pass
+                if not nums:
+                    continue
+                    
+                if "promoter" in row_title:
+                    promoters = nums
+                elif "fii" in row_title or "foreign" in row_title:
+                    fiis = nums
+                elif "dii" in row_title or "domestic" in row_title:
+                    diis = nums
+                elif "public" in row_title or "retail" in row_title:
+                    public = nums
+                    
+            # Combine FIIs + DIIs for total Institutional Holding
+            inst = []
+            if fiis and diis and len(fiis) == len(diis):
+                inst = [round(f + d, 2) for f, d in zip(fiis, diis)]
+            elif fiis:
+                inst = fiis
+            elif diis:
+                inst = diis
+                
+            if promoters or inst or public:
+                return (
+                    classify_5q_trend(promoters),
+                    classify_5q_trend(inst),
+                    classify_5q_trend(public)
+                )
+        except Exception:
+            continue
+            
+    # Fallback to yfinance snapshot if Screener symbol mapping differs
+    if yf_info:
+        insiders = (yf_info.get("heldPercentInsiders") or 0.0) * 100.0
+        inst_pct = (yf_info.get("heldPercentInstitutions") or 0.0) * 100.0
+        if insiders > 0 or inst_pct > 0:
+            retail_pct = max(0.0, 100.0 - insiders - inst_pct)
+            return (
+                f"Snapshot: {insiders:.1f}%",
+                f"Snapshot: {inst_pct:.1f}%",
+                f"Snapshot: {retail_pct:.1f}%"
+            )
+            
+    return "N/A", "N/A", "N/A"
 
 # --- CORE INSTITUTIONAL LOGIC FUNCTIONS ---
 def calculate_moat_grade(roce, roe, de):
@@ -119,7 +224,7 @@ if ticker_file is not None:
 
     st.write(f"📥 Loaded **{len(raw_tickers)}** ticker symbols from your file.")
 
-    if st.button("🚀 Fetch Audited Statements & Run Institutional Screening", type="primary"):
+    if st.button("🚀 Fetch Audited Statements, 5Q Shareholding & Run Screening", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -127,23 +232,22 @@ if ticker_file is not None:
         total = len(raw_tickers)
         
         for idx, t in enumerate(raw_tickers):
-            clean_t = str(t).upper().strip()
-            if not clean_t.endswith(".NS"):
-                clean_t += ".NS"
+            base_symbol = str(t).upper().strip().replace(".NS", "")
+            clean_t = base_symbol + ".NS"
                 
-            status_text.text(f"Analyzing Statements ({idx+1}/{total}): {clean_t}...")
+            status_text.text(f"Analyzing Statements & 5Q Shareholding ({idx+1}/{total}): {base_symbol}...")
             progress_bar.progress((idx + 1) / total)
             
             try:
                 stock = yf.Ticker(clean_t)
                 info = stock.info
                 
-                # Fetch True Audited Financial Statements (same as single-stock analyzer)
+                # Fetch True Audited Financial Statements
                 inc_stmt = stock.financials
                 bal_sheet = stock.balance_sheet
                 cf_stmt = stock.cashflow
                 
-                name = info.get("longName", clean_t.replace(".NS", ""))
+                name = info.get("longName", base_symbol)
                 sector = info.get("sector", "N/A")
                 industry = info.get("industry", "N/A")
                 
@@ -180,7 +284,6 @@ if ticker_file is not None:
                 current_liab = get_statement_value(bal_sheet, ["Current Liabilities", "Total Current Liabilities"])
                 
                 # Standard Accounting Capital Employed: (Total Assets - Current Liabilities) OR (Total Equity + Total Debt)
-                # Note: Do NOT subtract Cash, as doing so artificially inflates ROCE for cash-rich PSUs like Coal India!
                 if total_assets > 0 and current_liab > 0 and (total_assets - current_liab) > 0:
                     capital_employed = total_assets - current_liab
                 else:
@@ -208,36 +311,27 @@ if ticker_file is not None:
                 wacc_dec = default_wacc / 100.0
                 term_g_dec = default_term_g / 100.0
                 
-                # Reverse DCF Implied Growth (g1)
                 implied_g1 = solve_reverse_dcf(cmp, fcf, wacc_dec, term_g_dec, shares)
-                
-                # Sustainable Forward Growth Rate (Reinvestment Rate * ROE, capped between 6% and 18%)
                 sustainable_g = min(0.18, max(0.06, (roe / 100.0) * 0.65)) if roe > 0 else 0.08
                 
-                # Model A: True 10-Yr Forward DCF Intrinsic Value
                 dcf_iv = calculate_forward_dcf_iv(fcf, shares, sustainable_g, wacc_dec, term_g_dec)
                 if dcf_iv <= 0 and eps > 0:
                     dcf_iv = eps * 15.0
                 
-                # Model B: Graham Intrinsic Value = sqrt(22.5 * EPS * BVPS)
                 graham_val = math.sqrt(22.5 * eps * bvps) if (eps > 0 and bvps > 0) else 0.0
                 
-                # Model C: Quality-Adjusted Fair P/E Multiple IV
                 fair_pe_mult = 22.0 if moat == "A+" else (18.0 if moat == "A" else (15.0 if moat == "B" else 10.0))
                 pe_iv = eps * fair_pe_mult if eps > 0 else 0.0
                 
-                # Blended Intrinsic Value
                 valid_ivs = [v for v in [graham_val, dcf_iv, pe_iv] if v > 0]
                 blended_iv = np.mean(valid_ivs) if valid_ivs else cmp
                 
-                # PEG Ratio (Fallback to PE / Sustainable Growth if missing from info)
                 peg = info.get("pegRatio")
                 if not peg or peg <= 0:
                     peg = (pe / (sustainable_g * 100.0)) if (pe > 0 and sustainable_g > 0) else 0.0
                 
                 anchor, sip_z, garp_z, is_in_zone = compute_buy_zones(cmp, dcf_iv, graham_val, pe_iv, moat)
                 
-                # Institutional Verdict
                 if moat in ["A+", "A"] and cmp <= anchor * 1.05 and implied_g1 <= 15.0:
                     verdict = "💎 ELITE COMPOUNDING BUY"
                 elif moat in ["A+", "A", "B"] and cmp <= anchor * 1.10 and implied_g1 <= 14.0:
@@ -249,8 +343,12 @@ if ticker_file is not None:
                 else:
                     verdict = "🔴 PRICED FOR PERFECTION"
                     
+                # --- 7. 5-QUARTER SHAREHOLDING TRENDS (PROMOTER, INSTITUTIONAL, RETAIL) ---
+                prom_trend, inst_trend, retail_trend = fetch_5q_shareholding_trends(base_symbol, info)
+                time.sleep(0.15) # Polite rate-limiting delay
+                    
                 results.append({
-                    "Ticker": clean_t.replace(".NS", ""),
+                    "Ticker": base_symbol,
                     "Company Name": name,
                     "Sector": sector,
                     "Industry": industry,
@@ -268,12 +366,15 @@ if ticker_file is not None:
                     "Implied Growth (g₁ %)": implied_g1,
                     "Valuation Anchor (₹)": round(anchor, 2),
                     "In Active Buy Zone": "✅ Yes" if is_in_zone else "❌ No",
-                    "Institutional Verdict": verdict
+                    "Institutional Verdict": verdict,
+                    "Institutional Trend (5Q)": inst_trend,
+                    "Retail Holding Trend (5Q)": retail_trend,
+                    "Promoter Holding Trend (5Q)": prom_trend
                 })
             except Exception:
                 continue
 
-        status_text.text("✅ Audited statement extraction and valuation complete!")
+        status_text.text("✅ Audited statement extraction, valuation, and 5Q shareholding analysis complete!")
         
         if results:
             res_df = pd.DataFrame(results)
