@@ -11,7 +11,7 @@ import yfinance as yf
 st.set_page_config(page_title="Institutional All-in-One Nifty Screener", layout="wide")
 
 st.title("🛡️ Institutional All-in-One Stock Screener & Valuation Engine")
-st.markdown("Upload your NSE ticker list (`.txt` or `.csv`). This engine extracts audited financial statements for exact ROCE/ROE, Multi-Model Intrinsic Values (Graham, DCF, P/E), and **5-Quarter Shareholding Trends (Promoter, Institutional, Retail)**.")
+st.markdown("Upload your NSE ticker list (`.txt` or `.csv`). This engine extracts audited financial statements, computes Multi-Model Intrinsic Values, tracks 5Q Shareholding trends, and categorizes stocks into **Aggressive Compounders vs. Defensive Anchors** via Beta ($\beta$).")
 
 # --- SIDEBAR: CONTROLS & UPLOAD ---
 st.sidebar.header("1. Upload Ticker List")
@@ -28,9 +28,22 @@ max_pe = st.sidebar.slider("Max Trailing P/E", 5.0, 100.0, 35.0, 1.0)
 max_peg = st.sidebar.slider("Max PEG Ratio", 0.1, 5.0, 2.5, 0.1)
 selected_moats = st.sidebar.multiselect("Filter Moat Grades", ["A+", "A", "B", "C", "D"], default=["A+", "A", "B"])
 
+st.sidebar.header("4. Growth Persona Filter (Beta)")
+selected_personas = st.sidebar.multiselect(
+    "Filter by Investment Persona",
+    [
+        "🚀 Aggressive Compounder", 
+        "🛡️ Defensive Anchor", 
+        "🟡 Fairly Priced Compounder", 
+        "⚠️ High-Beta Cyclical / Speculative",
+        "🔴 Priced for Perfection", 
+        "🛑 Weak Moat / Value Trap"
+    ],
+    default=["🚀 Aggressive Compounder", "🛡️ Defensive Anchor"]
+)
+
 # --- HELPER: SAFE STATEMENT EXTRACTION ---
 def get_statement_value(df, possible_keys, default=0.0):
-    """Safely extracts the latest annual figure from yfinance financial dataframes."""
     if df is None or df.empty:
         return default
     for key in possible_keys:
@@ -42,10 +55,6 @@ def get_statement_value(df, possible_keys, default=0.0):
 
 # --- HELPER: 5-QUARTER SHAREHOLDING TREND EXTRACTOR ---
 def classify_5q_trend(series_vals, threshold=0.25):
-    """
-    Compares the last 5 quarters (oldest to latest).
-    threshold = 0.25% (25 bps) change over 5 quarters to distinguish Rising/Decline from Flat.
-    """
     if not series_vals or len(series_vals) < 2:
         return "N/A"
     window = series_vals[-5:] if len(series_vals) >= 5 else series_vals
@@ -61,10 +70,6 @@ def classify_5q_trend(series_vals, threshold=0.25):
         return f"➖ Flat ({end_val:.1f}% | {diff:+.2f}%)"
 
 def fetch_5q_shareholding_trends(nse_symbol, yf_info=None):
-    """
-    Scrapes the last 5 quarters of SEBI Shareholding Pattern (Promoters, FII+DII Institutions, Public/Retail)
-    from Screener.in public company page, with fallback to yfinance current snapshot if unavailable.
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
@@ -109,7 +114,6 @@ def fetch_5q_shareholding_trends(nse_symbol, yf_info=None):
                 elif "public" in row_title or "retail" in row_title:
                     public = nums
                     
-            # Combine FIIs + DIIs for total Institutional Holding
             inst = []
             if fiis and diis and len(fiis) == len(diis):
                 inst = [round(f + d, 2) for f, d in zip(fiis, diis)]
@@ -127,7 +131,6 @@ def fetch_5q_shareholding_trends(nse_symbol, yf_info=None):
         except Exception:
             continue
             
-    # Fallback to yfinance snapshot if Screener symbol mapping differs
     if yf_info:
         insiders = (yf_info.get("heldPercentInsiders") or 0.0) * 100.0
         inst_pct = (yf_info.get("heldPercentInstitutions") or 0.0) * 100.0
@@ -185,7 +188,6 @@ def solve_reverse_dcf(cmp, fcf_0, wacc, term_g, shares):
     return round(max(-20.0, min(80.0, best_g)), 2)
 
 def calculate_forward_dcf_iv(fcf_0, shares, growth_rate, wacc, term_g):
-    """Computes true 10-year Forward DCF Intrinsic Value per share."""
     if fcf_0 <= 0 or shares <= 0:
         return 0.0
     cf_per_share = fcf_0 / shares
@@ -212,6 +214,29 @@ def compute_buy_zones(cmp, dcf_iv, graham_val, pe_iv, moat_grade):
     
     return anchor, sip_zone, garp_zone, (in_sip or in_garp or in_deep)
 
+def classify_growth_persona(moat, roce, roe, de, cmp, anchor, implied_g1, beta):
+    """
+    Categorizes quality stocks at reasonable prices based on beta:
+    - High Beta (>= 1.05) + Moat A+/A/B + Fair Price -> Aggressive Compounder
+    - Low Beta (< 1.05) + Moat A+/A/B + Fair Price -> Defensive Anchor
+    """
+    is_quality = moat in ["A+", "A", "B"] and roce >= 12.0 and de <= 0.8
+    is_fair_or_undervalued = cmp <= (anchor * 1.15) and implied_g1 <= 16.0
+
+    if is_quality and is_fair_or_undervalued:
+        if beta >= 1.05:
+            return "🚀 Aggressive Compounder"
+        else:
+            return "🛡️ Defensive Anchor"
+    elif is_quality and implied_g1 <= 20.0:
+        return "🟡 Fairly Priced Compounder"
+    elif beta > 1.10 and (roce < 12.0 or de > 0.8):
+        return "⚠️ High-Beta Cyclical / Speculative"
+    elif implied_g1 > 20.0 or cmp > (anchor * 1.30):
+        return "🔴 Priced for Perfection"
+    else:
+        return "🛑 Weak Moat / Value Trap"
+
 # --- EXECUTION FLOW ---
 if ticker_file is not None:
     if ticker_file.name.endswith('.csv'):
@@ -224,7 +249,7 @@ if ticker_file is not None:
 
     st.write(f"📥 Loaded **{len(raw_tickers)}** ticker symbols from your file.")
 
-    if st.button("🚀 Fetch Audited Statements, 5Q Shareholding & Run Screening", type="primary"):
+    if st.button("🚀 Fetch Audited Statements, Beta, 5Q Trends & Screen", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -235,14 +260,13 @@ if ticker_file is not None:
             base_symbol = str(t).upper().strip().replace(".NS", "")
             clean_t = base_symbol + ".NS"
                 
-            status_text.text(f"Analyzing Statements & 5Q Shareholding ({idx+1}/{total}): {base_symbol}...")
+            status_text.text(f"Extracting ({idx+1}/{total}): {base_symbol}...")
             progress_bar.progress((idx + 1) / total)
             
             try:
                 stock = yf.Ticker(clean_t)
                 info = stock.info
                 
-                # Fetch True Audited Financial Statements
                 inc_stmt = stock.financials
                 bal_sheet = stock.balance_sheet
                 cf_stmt = stock.cashflow
@@ -256,19 +280,22 @@ if ticker_file is not None:
                 pe = info.get("trailingPE") or (cmp / eps if eps > 0 else 0.0)
                 shares = info.get("sharesOutstanding") or 0.0
                 
+                # --- BETA VALUE EXTRACTION ---
+                # Fallback to 1.0 (market neutral) if beta is not reported by exchange
+                beta = info.get("beta")
+                beta = round(float(beta), 2) if beta is not None else 1.00
+                
                 if cmp == 0 or shares == 0:
                     continue
                 
-                # --- 1. EXACT INCOME STATEMENT EXTRACTION ---
+                # Financial statements parsing
                 ebit = get_statement_value(inc_stmt, ["EBIT", "Operating Income", "Total Operating Income As Reported"])
                 net_income = get_statement_value(inc_stmt, ["Net Income", "Net Income Common Stockholders", "Net Income Continuous Operations"])
-                
                 if net_income == 0:
                     net_income = info.get("netIncomeToCommon") or (eps * shares)
                 if ebit == 0:
                     ebit = info.get("ebitda", net_income * 1.35) * 0.85
                 
-                # --- 2. EXACT BALANCE SHEET EXTRACTION ---
                 total_equity = get_statement_value(bal_sheet, ["Stockholders Equity", "Total Equity Gross Minority Interest", "Common Stock Equity"])
                 if total_equity == 0:
                     bvps = info.get("bookValue") or 0.0
@@ -283,18 +310,15 @@ if ticker_file is not None:
                 total_assets = get_statement_value(bal_sheet, ["Total Assets"])
                 current_liab = get_statement_value(bal_sheet, ["Current Liabilities", "Total Current Liabilities"])
                 
-                # Standard Accounting Capital Employed: (Total Assets - Current Liabilities) OR (Total Equity + Total Debt)
                 if total_assets > 0 and current_liab > 0 and (total_assets - current_liab) > 0:
                     capital_employed = total_assets - current_liab
                 else:
                     capital_employed = total_equity + total_debt
                     
-                # --- 3. EXACT ROE, ROCE & DEBT/EQUITY ---
                 roce = round((ebit / capital_employed) * 100.0, 2) if capital_employed > 0 else 0.0
                 roe = round((net_income / total_equity) * 100.0, 2) if total_equity > 0 else 0.0
                 de_ratio = round(total_debt / total_equity, 2) if total_equity > 0 else 0.0
                 
-                # --- 4. EXACT FREE CASH FLOW ---
                 fcf = get_statement_value(cf_stmt, ["Free Cash Flow"])
                 if fcf == 0:
                     ocf = get_statement_value(cf_stmt, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"])
@@ -304,13 +328,10 @@ if ticker_file is not None:
                     else:
                         fcf = info.get("freeCashflow") or (net_income * 0.70)
                         
-                # --- 5. MOAT GRADING ---
                 moat = calculate_moat_grade(roce, roe, de_ratio)
                 
-                # --- 6. VALUATION MODELS (GRAHAM, FORWARD DCF, P/E, REVERSE DCF) ---
                 wacc_dec = default_wacc / 100.0
                 term_g_dec = default_term_g / 100.0
-                
                 implied_g1 = solve_reverse_dcf(cmp, fcf, wacc_dec, term_g_dec, shares)
                 sustainable_g = min(0.18, max(0.06, (roe / 100.0) * 0.65)) if roe > 0 else 0.08
                 
@@ -319,7 +340,6 @@ if ticker_file is not None:
                     dcf_iv = eps * 15.0
                 
                 graham_val = math.sqrt(22.5 * eps * bvps) if (eps > 0 and bvps > 0) else 0.0
-                
                 fair_pe_mult = 22.0 if moat == "A+" else (18.0 if moat == "A" else (15.0 if moat == "B" else 10.0))
                 pe_iv = eps * fair_pe_mult if eps > 0 else 0.0
                 
@@ -332,24 +352,18 @@ if ticker_file is not None:
                 
                 anchor, sip_z, garp_z, is_in_zone = compute_buy_zones(cmp, dcf_iv, graham_val, pe_iv, moat)
                 
-                if moat in ["A+", "A"] and cmp <= anchor * 1.05 and implied_g1 <= 15.0:
-                    verdict = "💎 ELITE COMPOUNDING BUY"
-                elif moat in ["A+", "A", "B"] and cmp <= anchor * 1.10 and implied_g1 <= 14.0:
-                    verdict = "🟢 ATTRACTIVE GARP"
-                elif moat in ["D", "C"] and roce < 12.0:
-                    verdict = "🛑 WEAK MOAT / VALUE TRAP"
-                elif implied_g1 <= 20.0:
-                    verdict = "🟡 FAIRLY PRICED / HOLD"
-                else:
-                    verdict = "🔴 PRICED FOR PERFECTION"
-                    
-                # --- 7. 5-QUARTER SHAREHOLDING TRENDS (PROMOTER, INSTITUTIONAL, RETAIL) ---
+                # --- GROWTH PERSONA CLASSIFICATION (BETA + QUALITY + VALUATION) ---
+                persona_verdict = classify_growth_persona(moat, roce, roe, de_ratio, cmp, anchor, implied_g1, beta)
+                
+                # Shareholding trend scrape
                 prom_trend, inst_trend, retail_trend = fetch_5q_shareholding_trends(base_symbol, info)
-                time.sleep(0.15) # Polite rate-limiting delay
+                time.sleep(0.15)
                     
                 results.append({
                     "Ticker": base_symbol,
                     "Company Name": name,
+                    "Growth Persona": persona_verdict,
+                    "Beta (β)": beta,
                     "Sector": sector,
                     "Industry": industry,
                     "Moat Grade": moat,
@@ -366,7 +380,6 @@ if ticker_file is not None:
                     "Implied Growth (g₁ %)": implied_g1,
                     "Valuation Anchor (₹)": round(anchor, 2),
                     "In Active Buy Zone": "✅ Yes" if is_in_zone else "❌ No",
-                    "Institutional Verdict": verdict,
                     "Institutional Trend (5Q)": inst_trend,
                     "Retail Holding Trend (5Q)": retail_trend,
                     "Promoter Holding Trend (5Q)": prom_trend
@@ -374,7 +387,7 @@ if ticker_file is not None:
             except Exception:
                 continue
 
-        status_text.text("✅ Audited statement extraction, valuation, and 5Q shareholding analysis complete!")
+        status_text.text("✅ Multi-factor screener run complete!")
         
         if results:
             res_df = pd.DataFrame(results)
@@ -389,18 +402,19 @@ if ticker_file is not None:
             (res_df["Debt/Equity"] <= max_de) &
             ((res_df["Trailing P/E"] <= max_pe) & (res_df["Trailing P/E"] > 0)) &
             ((res_df["PEG Ratio"] <= max_peg) | (res_df["PEG Ratio"] == 0.0)) &
-            (res_df["Moat Grade"].isin(selected_moats))
+            (res_df["Moat Grade"].isin(selected_moats)) &
+            (res_df["Growth Persona"].isin(selected_personas))
         ]
         
         st.subheader(f"📊 Screening Results Summary ({len(filtered_df)} of {len(res_df)} stocks matched)")
         
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Successfully Analyzed", len(res_df))
-        col2.metric("Matching Filters", len(filtered_df))
-        col3.metric("A+ Moat Count", len(res_df[res_df["Moat Grade"] == "A+"]))
-        col4.metric("In Buy Zone", len(filtered_df[filtered_df["In Active Buy Zone"] == "✅ Yes"]))
+        col1.metric("Total Analyzed", len(res_df))
+        col2.metric("Matching Shortlist", len(filtered_df))
+        col3.metric("🚀 Aggressive Compounders", len(res_df[res_df["Growth Persona"] == "🚀 Aggressive Compounder"]))
+        col4.metric("🛡️ Defensive Anchors", len(res_df[res_df["Growth Persona"] == "🛡️ Defensive Anchor"]))
         
-        # Frozen Ticker & Company Name columns on the left
+        # Frozen Ticker & Company Name columns
         st.dataframe(
             filtered_df,
             use_container_width=True,
@@ -408,16 +422,17 @@ if ticker_file is not None:
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker", pinned=True),
                 "Company Name": st.column_config.TextColumn("Company Name", pinned=True),
+                "Growth Persona": st.column_config.TextColumn("Growth Persona", pinned=True),
             }
         )
         
         csv_bytes = filtered_df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Download Filtered Institutional Shortlist (CSV)",
+            label="📥 Download Filtered Shortlist (CSV)",
             data=csv_bytes,
-            file_name="institutional_allinone_shortlist.csv",
+            file_name="institutional_screener_persona_shortlist.csv",
             mime="text/csv"
         )
 
 else:
-    st.info("👈 Please upload a text or CSV file containing your list of stock symbols in the sidebar to begin.")
+    st.info("👈 Please upload your ticker file in the sidebar to begin.")
