@@ -317,7 +317,7 @@ def analyze(sym):
         analyst = info.get("targetMeanPrice") or np.nan
         r = lambda x, n=2: round(float(x), n) if np.isfinite(x) else np.nan
         return {
-            "Ticker": sym, "Company": info.get("longName", sym), "Sector": sector, "Style": style, "Beta": beta,
+            "Ticker": sym, "Price Date": str(close.index[-1].date()), "Company": info.get("longName", sym), "Sector": sector, "Style": style, "Beta": beta,
             "Moat": moat, "Quality": r(q, 1), "Valuation": r(v, 1), "Growth": r(g, 1), "Trend": r(tech, 1),
             "Long Score": r(long_s, 1), "Medium Score": r(med_s, 1), "Short Score": r(short_s, 1),
             "Long OK": bool(long_ok), "Medium OK": bool(med_ok), "Short OK": bool(short_ok),
@@ -349,8 +349,9 @@ def load_tickers(f):
     out = [re.sub(r"\.(NS|BO)$", "", str(x).strip().upper()) for x in vals.dropna() if str(x).strip()]
     return list(dict.fromkeys(out))  # de-duplicate, keep order
 
-tab_long, tab_med, tab_short, tab_all, tab_logic = st.tabs(
-    ["🌳 Long Term (3-5y+)", "📈 Medium Term (6-18m)", "⚡ Short Term (1-3m)", "🗂️ All Data", "🧠 Methodology"])
+tab_long, tab_med, tab_short, tab_all, tab_track, tab_guide, tab_logic = st.tabs(
+    ["🌳 Long Term (3-5y+)", "📈 Medium Term (6-18m)", "⚡ Short Term (1-3m)", "🗂️ All Data",
+     "🎯 Track Record", "📖 Guide & Glossary", "🧠 Methodology"])
 
 if ticker_file is None:
     st.info("👈 Upload your ticker file in the sidebar to begin.")
@@ -376,10 +377,22 @@ else:
         if skip_fin:
             base = base[base["Sector"] != "Financial Services"]
 
+        snap = []
+        SNAP = {"long": ("Long Review Stop", "Long Target (3y)", 1095),
+                "medium": ("Medium Stop", "Medium Target", 540),
+                "short": ("Short Stop", "Short Target", 90)}
+
         def show(tab, name, score, ok, cols, blurb):
             with tab:
                 st.markdown(blurb)
                 d = base[base[ok] & (base[score] >= min_score)].sort_values(score, ascending=False).head(top_n)
+                if not d.empty:
+                    sc, tc, days = SNAP[name]
+                    x = d[["Ticker", "Company", score, "Style", "Moat", "Quality", "Price Date", "CMP", sc, tc]].copy()
+                    x.columns = ["Ticker", "Company", "Score", "Style", "Moat", "Quality", "Analysis Date", "Entry", "Stop", "Target"]
+                    x.insert(2, "Horizon", name.capitalize())
+                    x["Horizon Days"] = days
+                    snap.append(x)
                 st.subheader(f"{len(d)} stocks qualify")
                 if d.empty:
                     st.warning("None pass the gates. Lower 'Min horizon score' or relax filters.")
@@ -406,6 +419,14 @@ else:
              "**Momentum setups with a quality floor.** Trend 55%, quality 25%, valuation 10%, ownership 10%. "
              "Gates: price > 50-DMA, RSI 40-72 (not overheated), within 20% of 52-week high, turnover ≥ ₹2 Cr/day, Quality ≥ 40. "
              "Stop = tighter of CMP − 2×ATR or below 20-day swing low; Target = 2× the risk, capped at 52-week-high resistance.")
+        with tab_track:
+            if snap:
+                sdf = pd.concat(snap, ignore_index=True)
+                st.success(f"Snapshot ready: {len(sdf)} picks across all horizons. Download it NOW and keep it safe.")
+                st.download_button("📥 Download Snapshot (needed for verification later)", sdf.to_csv(index=False).encode(),
+                                   f"snapshot_{sdf['Analysis Date'].max()}.csv", "text/csv", key="snap_dl")
+            else:
+                st.info("No picks qualify with the current filters, so there is nothing to snapshot.")
         with tab_all:
             st.dataframe(base, hide_index=True, use_container_width=True)
             st.download_button("📥 All data CSV", base.to_csv(index=False).encode(), "all_data.csv", "text/csv")
@@ -449,4 +470,102 @@ Every stock gets four 0-100 sub-scores, which are combined differently for each 
 | Short | T 55 · Q 25 · V 10 · O 10 | price > 50-DMA, RSI 40-72, liquid |
 
 **Limits:** Yahoo gives only ~4 years of statements, data for Indian small caps can be incomplete, and the model cannot see management integrity, regulation, or news. Always read the annual report before buying.
+""")
+
+
+# ───────────────────────── TRACK RECORD (outcome verification) ─────────────────────────
+def check_outcome(r, nifty):
+    """Replay daily candles after the analysis date. First of target/stop touched wins.
+    Same-day touch of both = stop assumed first (conservative). Gaps exit at the open price."""
+    try:
+        start = pd.to_datetime(r["Analysis Date"])
+        h = yf.Ticker(f"{r['Ticker']}.NS").history(start=(start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"), auto_adjust=True)
+        h.index = h.index.tz_localize(None)
+        h = h[h.index > start]
+        if h.empty:
+            return {"Status": "⏳ Too early"}
+        entry, stop, tgt = float(r["Entry"]), float(r["Stop"]), float(r["Target"])
+        ht, hs = h.index[h["High"] >= tgt], h.index[h["Low"] <= stop]
+        t0, s0 = (ht[0] if len(ht) else None), (hs[0] if len(hs) else None)
+        if s0 is not None and (t0 is None or s0 <= t0):
+            status, d, ex = "🛑 Stop hit", s0, min(stop, float(h.loc[s0, "Open"]))
+        elif t0 is not None:
+            status, d, ex = "🎯 Target hit", t0, max(tgt, float(h.loc[t0, "Open"]))
+        else:
+            d, ex = h.index[-1], float(h["Close"].iloc[-1])
+            status = "⌛ Expired (no hit)" if (d - start).days >= int(r["Horizon Days"]) else "⏳ Open"
+        seg = h.loc[:d]
+        n0, n1 = nifty.asof(start), nifty.asof(d)
+        ret = (ex / entry - 1) * 100
+        return {"Status": status, "Exit/Last Price": round(ex, 2), "Return %": round(ret, 2),
+                "Nifty %": round((n1 / n0 - 1) * 100, 2), "Alpha %": round(ret - (n1 / n0 - 1) * 100, 2),
+                "Max Drawdown %": round((seg["Low"].min() / entry - 1) * 100, 2),
+                "Max Run-up %": round((seg["High"].max() / entry - 1) * 100, 2), "Days": (d - start).days}
+    except Exception as e:
+        return {"Status": f"❌ Error: {type(e).__name__}"}
+
+with tab_track:
+    st.divider()
+    st.subheader("🔍 Verify a past snapshot")
+    st.caption("Upload the snapshot CSV you downloaded earlier (e.g., after 3-6 months). The app replays every daily candle since "
+               "the analysis date, checks whether Target or Stop was touched first, and compares with the Nifty 50.")
+    up = st.file_uploader("Snapshot CSV", type=["csv"], key="snap_up")
+    if up is not None:
+        old = pd.read_csv(up)
+        need = {"Ticker", "Horizon", "Analysis Date", "Entry", "Stop", "Target", "Horizon Days"}
+        if not need.issubset(old.columns):
+            st.error(f"Wrong file. Required columns: {sorted(need)}. Use the 'Download Snapshot' button, not the per-tab CSVs.")
+        elif st.button("✅ Check outcomes", type="primary"):
+            nf = yf.Ticker("^NSEI").history(start=(pd.to_datetime(old["Analysis Date"]).min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"))["Close"]
+            nf.index = nf.index.tz_localize(None)
+            rows, bar = [], st.progress(0)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(check_outcome, r, nf): i for i, r in old.iterrows()}
+                for k, fu in enumerate(as_completed(futs), 1):
+                    rows.append((futs[fu], fu.result()))
+                    bar.progress(k / len(futs))
+            out = pd.DataFrame([r for _, r in sorted(rows, key=lambda z: z[0])], index=old.index)
+            st.session_state["track"] = pd.concat([old[["Ticker", "Horizon", "Analysis Date", "Entry", "Stop", "Target"]], out], axis=1)
+
+    tr = st.session_state.get("track")
+    if tr is not None and "Return %" in tr:
+        done = tr.dropna(subset=["Return %"])
+        summ = []
+        for hz, g in done.groupby("Horizon"):
+            tgt_n, stp_n = g["Status"].str.contains("Target").sum(), g["Status"].str.contains("Stop").sum()
+            summ.append({"Horizon": hz, "Picks": len(g), "🎯 Target %": round(tgt_n / len(g) * 100, 1),
+                         "🛑 Stop %": round(stp_n / len(g) * 100, 1),
+                         "Still open/expired %": round((len(g) - tgt_n - stp_n) / len(g) * 100, 1),
+                         "Target ÷ (Target+Stop) %": round(tgt_n / (tgt_n + stp_n) * 100, 1) if tgt_n + stp_n else np.nan,
+                         "Win rate % (ret>0)": round((g["Return %"] > 0).mean() * 100, 1),
+                         "Avg return %": round(g["Return %"].mean(), 2), "Median return %": round(g["Return %"].median(), 2),
+                         "Avg alpha vs Nifty %": round(g["Alpha %"].mean(), 2), "Avg max drawdown %": round(g["Max Drawdown %"].mean(), 2)})
+        st.subheader("Scorecard by horizon")
+        st.dataframe(pd.DataFrame(summ), hide_index=True, use_container_width=True)
+        if len(done) < 30:
+            st.warning("Fewer than 30 picks: treat these numbers as anecdotal, not proof. Repeat the process over several snapshots.")
+        st.caption("Open positions are marked-to-market at the latest close. A medium/long pick checked after only 6 months is expected to be mostly 'Open'.")
+        st.dataframe(tr, hide_index=True, use_container_width=True)
+        st.download_button("📥 Download verification report", tr.to_csv(index=False).encode(), "verification_report.csv", "text/csv")
+
+# ───────────────────────── GUIDE ─────────────────────────
+with tab_guide:
+    st.markdown("""
+### Glossary
+| Metric | What it is | Why it matters |
+|---|---|---|
+| **3M Ret %** | Price change over the last ~63 trading days | Shows whether the market is currently rewarding the stock. Positive and moderate (0-25%) is healthy; very high means chasing |
+| **Off 52W High %** | How far price is below its 52-week high | Near the high = strength and little overhead supply. Over 20% below = broken trend, so short-term picks are excluded |
+| **Vol Surge x** | 20-day average volume ÷ 100-day average volume | Above ~1.15 means rising participation (often institutions) behind the move. Below 0.7 means fading interest |
+| **Turnover ₹Cr** | 20-day average daily traded value (price × volume) | Liquidity check. Under ₹2 Cr/day means entry/exit slippage and stop-loss gaps, so short-term picks are excluded |
+| **Rev CAGR %** | Compound annual revenue growth over the available years (~3) | Shows whether the business is actually expanding. Revenue growth with profit growth is a good sign. Profit growth without revenue growth is often cost-cutting or one-offs |
+
+### How to use it
+- Run after market close (after 3:30 pm IST) so the price is a clean closing price.
+- Re-run: short list weekly, medium list monthly, long list quarterly (after results season).
+- Download the **Snapshot** every time. It is your audit trail.
+- Verify short picks after 3 months, medium after 6-18 months, long after 1-3 years.
+- Never buy on a score alone: read the Red Flags column, the latest results and the annual report.
+- Risk at most 1-2% of your capital per trade; size positions from (entry - stop).
+- Don't move a stop lower, don't average down a short-term pick, don't ignore a stop because "fundamentals are good".
 """)
