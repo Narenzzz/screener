@@ -7,6 +7,124 @@ import streamlit as st
 import yfinance as yf
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import os, time, random, pickle
+
+# ───────────────── RATE-LIMIT-SAFE DATA LAYER (free) ─────────────────
+# Install: pip install -U yfinance curl_cffi
+try:
+    from curl_cffi import requests as curl_requests
+    YF_SESSION = curl_requests.Session(impersonate="chrome")  # looks like a real Chrome browser
+except Exception:
+    YF_SESSION = None
+KW = {"session": YF_SESSION} if YF_SESSION else {}
+CACHE_DIR = ".screener_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+FORCE = {"v": False}
+
+class RateLimited(Exception):
+    pass
+
+def tk(sym):
+    return yf.Ticker(sym, **KW)
+
+def _cpath(key):
+    return os.path.join(CACHE_DIR, re.sub(r"[^A-Za-z0-9_.^-]", "_", key) + ".pkl")
+
+def cache_get(key, ttl_hours):
+    f = _cpath(key)
+    if not FORCE["v"] and os.path.exists(f) and time.time() - os.path.getmtime(f) < ttl_hours * 3600:
+        try:
+            with open(f, "rb") as fh:
+                return pickle.load(fh)
+        except Exception:
+            return None
+    return None
+
+def cache_put(key, obj):
+    try:
+        with open(_cpath(key), "wb") as fh:
+            pickle.dump(obj, fh)
+    except Exception:
+        pass
+
+def is_rl(e):
+    m = (type(e).__name__ + str(e)).lower()
+    return "ratelimit" in m or "429" in m or "too many requests" in m
+
+def with_retry(fn, tries=4, base=5):
+    """Exponential backoff (5s, 10s, 20s...) only on rate-limit errors."""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if not is_rl(e):
+                raise
+            if i == tries - 1:
+                raise RateLimited(str(e)[:100])
+            time.sleep(base * 2 ** i + random.random() * 2)
+
+def get_nifty_close():
+    c = cache_get("px_NIFTY", 12)
+    if c is None:
+        c = with_retry(lambda: tk("^NSEI").history(period="5y", auto_adjust=False)["Close"])
+        c.index = pd.to_datetime(c.index).tz_localize(None)
+        cache_put("px_NIFTY", c)
+    return c
+
+def get_prices(syms, errs, adj=True, period="3y"):
+    """ONE batched request per 20 tickers (instead of one per ticker). Cached 12h per ticker."""
+    suf = "" if adj else "_raw"
+    out, need = {}, []
+    for sy in syms:
+        c = cache_get(f"px_{sy}{suf}", 12)
+        if c is not None:
+            out[sy] = c
+        else:
+            need.append(sy)
+    for i in range(0, len(need), 20):
+        chunk = need[i:i + 20]
+        def dl():
+            data = yf.download([x + ".NS" for x in chunk], period=period, auto_adjust=adj, group_by="ticker",
+                               threads=False, progress=False, **KW)
+            if data is None or data.empty:
+                raise RuntimeError("429 Too Many Requests (empty batch)")
+            return data
+        try:
+            data = with_retry(dl, tries=3, base=8)
+        except Exception as e:
+            for sy in chunk:
+                errs[sy] = f"Price download failed: {str(e)[:70]}"
+            continue
+        for sy in chunk:
+            try:
+                df = data[sy + ".NS"] if isinstance(data.columns, pd.MultiIndex) else data
+                df = df.dropna(how="all")
+                if df.empty:
+                    errs[sy] = "No price data (check symbol)"
+                    continue
+                df.index = pd.to_datetime(df.index).tz_localize(None)
+                cache_put(f"px_{sy}{suf}", df)
+                out[sy] = df
+            except KeyError:
+                errs[sy] = "No price data (check symbol)"
+        time.sleep(2 + random.random())
+    return out
+
+def get_fundamentals(sym):
+    """info + 4 statements, cached 7 days (fundamentals change quarterly). Returns (data, was_cached)."""
+    c = cache_get("fund_" + sym, 24 * 7)
+    if c is not None:
+        return c, True
+    t = tk(sym + ".NS")
+    d = {"info": with_retry(lambda: t.info) or {}}
+    if len(d["info"]) < 5:
+        raise ValueError("Empty company info (invalid symbol or throttled)")
+    d["inc"] = with_retry(lambda: t.financials)
+    d["bal"] = with_retry(lambda: t.balance_sheet)
+    d["cf"] = with_retry(lambda: t.cashflow)
+    d["qinc"] = with_retry(lambda: t.quarterly_financials)
+    cache_put("fund_" + sym, d)
+    return d, False
 
 st.set_page_config(page_title="Multi-Horizon Stock Screener", layout="wide")
 st.title("🛡️ Multi-Horizon Stock Screener: Short, Medium & Long Term")
@@ -28,7 +146,12 @@ max_de = st.sidebar.slider("Max Debt/Equity (non-financials)", 0.0, 3.0, 1.0, 0.
 max_pe = st.sidebar.slider("Max trailing P/E", 5.0, 150.0, 60.0, 1.0)
 skip_fin = st.sidebar.checkbox("Hide banks / NBFCs / insurers", False)
 top_n = st.sidebar.slider("Show top N per list", 5, 100, 25, 5)
-workers = st.sidebar.slider("Parallel downloads", 1, 8, 4)
+delay = st.sidebar.slider("Delay between tickers (s)", 0.5, 5.0, 1.5, 0.5)
+force = st.sidebar.checkbox("Ignore cache (force refresh)", False)
+if st.sidebar.button("🗑️ Clear cache"):
+    for _f in os.listdir(CACHE_DIR):
+        os.remove(os.path.join(CACHE_DIR, _f))
+    st.sidebar.success("Cache cleared")
 
 # ───────────────────────── HELPERS ─────────────────────────
 def lin(x, lo, hi, default=40.0):
@@ -88,8 +211,7 @@ def rsi(close, n=14):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def nifty_weekly():
-    h = yf.Ticker("^NSEI").history(period="3y")["Close"]
-    h.index = h.index.tz_localize(None)
+    h = get_nifty_close()
     return h.resample("W-FRI").last().pct_change().dropna()
 
 def real_beta(close, fallback):
@@ -115,6 +237,10 @@ def trend(vals, thr=0.25):
 def holdings(sym):
     """Scrape 5-quarter shareholding from Screener.in. Returns text + numeric deltas."""
     hdr = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36"}
+    cached = cache_get("hold_" + sym, 24 * 7)
+    if cached is not None:
+        return cached
+    time.sleep(0.5 + random.random())
     for mode in ("consolidated/", ""):
         try:
             r = requests.get(f"https://www.screener.in/company/{sym}/{mode}", headers=hdr, timeout=8)
@@ -143,29 +269,29 @@ def holdings(sym):
             inst = [round(a + b, 2) for a, b in zip(fii, dii)] if fii and dii and len(fii) == len(dii) else (fii or dii)
             if prom or inst:
                 (pt, pd_), (it, id_), (rt, rd_) = trend(prom), trend(inst), trend(pub)
-                return dict(prom=pt, inst=it, retail=rt, prom_d=pd_, inst_d=id_, retail_d=rd_,
-                            prom_now=prom[-1] if prom else np.nan)
+                res_h = dict(prom=pt, inst=it, retail=rt, prom_d=pd_, inst_d=id_, retail_d=rd_,
+                             prom_now=prom[-1] if prom else np.nan)
+                cache_put("hold_" + sym, res_h)
+                return res_h
         except Exception:
             continue
     return dict(prom="N/A", inst="N/A", retail="N/A", prom_d=0.0, inst_d=0.0, retail_d=0.0, prom_now=np.nan)
 
 # ───────────────────────── CORE ANALYSIS ─────────────────────────
-def analyze(sym):
+def analyze(sym, hist, d):
     try:
-        t = yf.Ticker(sym + ".NS")
-        info = t.info or {}
-        hist = t.history(period="3y", auto_adjust=True)
+        info = d["info"]
         if hist.empty or len(hist) < 220:
             return {"_err": "Insufficient price history (<220 sessions)"}
         close, high, low, vol = hist["Close"], hist["High"], hist["Low"], hist["Volume"]
         cmp = float(close.iloc[-1])
 
-        inc, bal, cfs = t.financials, t.balance_sheet, t.cashflow
+        inc, bal, cfs = d["inc"], d["bal"], d["cf"]
         sector = info.get("sector", "N/A")
         is_fin = sector == "Financial Services"
         shares = info.get("sharesOutstanding") or np.nan
         eps = info.get("trailingEps") or np.nan
-        pe = info.get("trailingPE") or (cmp / eps if eps and eps > 0 else np.nan)
+        pe = cmp / eps if eps and eps > 0 else np.nan  # recomputed from fresh price
 
         rev = stmt(inc, ["Total Revenue", "Operating Revenue"])
         ebit = stmt(inc, ["EBIT", "Operating Income"])
@@ -195,7 +321,7 @@ def analyze(sym):
         bvps = equity / shares if np.isfinite(equity) and np.isfinite(shares) and shares > 0 else np.nan
 
         # ── Profit-making trend (annual consistency + latest quarter momentum) ──
-        q_inc = t.quarterly_financials
+        q_inc = d["qinc"]
         qni = []
         if q_inc is not None and not q_inc.empty:
             for k in ("Net Income", "Net Income Common Stockholders"):
@@ -359,15 +485,39 @@ else:
     tickers = load_tickers(ticker_file)
     st.write(f"📥 Loaded **{len(tickers)}** unique symbols.")
     if st.button("🚀 Analyze & Rank", type="primary"):
+        FORCE["v"] = force
         res, errs, bar, txt = [], {}, st.progress(0), st.empty()
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(analyze, s): s for s in tickers}
-            for i, fu in enumerate(as_completed(futs), 1):
-                s, out = futs[fu], fu.result()
-                (errs.__setitem__(s, out["_err"]) if "_err" in out else res.append(out))
-                bar.progress(i / len(tickers))
-                txt.text(f"Processed {i}/{len(tickers)}: {s}")
-        txt.text("✅ Done")
+        txt.text("Step 1/2: downloading price history in batches (cached for 12h)...")
+        prices = get_prices(tickers, errs)
+        todo = [x for x in tickers if x in prices]
+        rl_streak, stopped_at = 0, None
+        for i, sy in enumerate(todo, 1):
+            txt.text(f"Step 2/2: analyzing {i}/{len(todo)}: {sy}")
+            bar.progress(i / max(len(todo), 1))
+            try:
+                fund, was_cached = get_fundamentals(sy)
+                rl_streak = 0
+            except RateLimited:
+                errs[sy] = "Rate limited by Yahoo"
+                rl_streak += 1
+                if rl_streak >= 3:
+                    stopped_at = i
+                    break
+                continue
+            except Exception as e:
+                errs[sy] = f"{type(e).__name__}: {str(e)[:80]}"
+                continue
+            out = analyze(sy, prices[sy], fund)
+            (errs.__setitem__(sy, out["_err"]) if "_err" in out else res.append(out))
+            if not was_cached:
+                time.sleep(delay + random.random())  # polite pause only when we actually hit Yahoo
+        if stopped_at:
+            for sy in todo[stopped_at - 1:]:
+                errs.setdefault(sy, "Not processed (Yahoo blocked the run)")
+            st.warning(f"⛔ Yahoo started blocking after {stopped_at - 1} stocks, so the run stopped safely. "
+                       "Everything fetched so far is cached on disk. Wait 15-60 minutes (or switch network), "
+                       "then click Analyze again. It resumes from the cache instead of starting over.")
+        txt.text(f"✅ Done: {len(res)} analyzed, {len(errs)} issues")
         st.session_state["df"], st.session_state["errs"] = pd.DataFrame(res), errs
 
     df = st.session_state.get("df")
@@ -476,14 +626,14 @@ Every stock gets four 0-100 sub-scores, which are combined differently for each 
 # ───────────────────────── TRACK RECORD (outcome verification) ─────────────────────────
 OUT_COLS = ["Status", "Exit/Last Price", "Return %", "Nifty %", "Alpha %", "Max Drawdown %", "Max Run-up %", "Days"]
 
-def check_outcome(r, nifty):
+def check_outcome(r, h_all, nifty):
     """Replay daily candles after the analysis date. First of target/stop touched wins.
     Same-day touch of both = stop assumed first (conservative). Gaps exit at the open price."""
     try:
         start = pd.to_datetime(r["Analysis Date"])
-        h = yf.Ticker(f"{r['Ticker']}.NS").history(start=(start - pd.Timedelta(days=1)).strftime("%Y-%m-%d"), auto_adjust=True)
-        h.index = h.index.tz_localize(None)
-        h = h[h.index > start]
+        if h_all is None:
+            return {"Status": "❌ No price data"}
+        h = h_all[h_all.index > start]
         if h.empty:
             return {"Status": "⏳ Too early"}
         entry, stop, tgt = float(r["Entry"]), float(r["Stop"]), float(r["Target"])
@@ -518,15 +668,19 @@ with tab_track:
         if not need.issubset(old.columns):
             st.error(f"Wrong file. Required columns: {sorted(need)}. Use the 'Download Snapshot' button, not the per-tab CSVs.")
         elif st.button("✅ Check outcomes", type="primary"):
-            nf = yf.Ticker("^NSEI").history(start=(pd.to_datetime(old["Analysis Date"]).min() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"))["Close"]
-            nf.index = nf.index.tz_localize(None)
-            rows, bar = [], st.progress(0)
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(check_outcome, r, nf): i for i, r in old.iterrows()}
-                for k, fu in enumerate(as_completed(futs), 1):
-                    rows.append((futs[fu], fu.result()))
-                    bar.progress(k / len(futs))
-            out = pd.DataFrame([r for _, r in sorted(rows, key=lambda z: z[0])], index=old.index).reindex(columns=OUT_COLS)
+            FORCE["v"] = False
+            try:
+                with st.spinner("Downloading price history (batched + cached)..."):
+                    e2 = {}
+                    pxs = get_prices(old["Ticker"].astype(str).str.upper().unique().tolist(), e2, adj=False)
+                    nf = get_nifty_close()
+            except Exception as e:
+                st.error(f"Could not download prices ({e}). If Yahoo is rate-limiting, wait 15-60 min and retry.")
+                st.stop()
+            rows = [check_outcome(r, pxs.get(str(r["Ticker"]).upper()), nf) for _, r in old.iterrows()]
+            out = pd.DataFrame(rows, index=old.index).reindex(columns=OUT_COLS)
+            if e2:
+                st.warning(f"{len(e2)} tickers had no price data: {list(e2)[:10]}")
             st.session_state["track"] = pd.concat([old[["Ticker", "Horizon", "Analysis Date", "Entry", "Stop", "Target"]], out], axis=1)
 
     tr = st.session_state.get("track")
