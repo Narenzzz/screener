@@ -474,6 +474,8 @@ Every stock gets four 0-100 sub-scores, which are combined differently for each 
 
 
 # ───────────────────────── TRACK RECORD (outcome verification) ─────────────────────────
+OUT_COLS = ["Status", "Exit/Last Price", "Return %", "Nifty %", "Alpha %", "Max Drawdown %", "Max Run-up %", "Days"]
+
 def check_outcome(r, nifty):
     """Replay daily candles after the analysis date. First of target/stop touched wins.
     Same-day touch of both = stop assumed first (conservative). Gaps exit at the open price."""
@@ -502,7 +504,7 @@ def check_outcome(r, nifty):
                 "Max Drawdown %": round((seg["Low"].min() / entry - 1) * 100, 2),
                 "Max Run-up %": round((seg["High"].max() / entry - 1) * 100, 2), "Days": (d - start).days}
     except Exception as e:
-        return {"Status": f"❌ Error: {type(e).__name__}"}
+        return {"Status": f"❌ Error: {type(e).__name__}: {str(e)[:80]}"}
 
 with tab_track:
     st.divider()
@@ -524,12 +526,19 @@ with tab_track:
                 for k, fu in enumerate(as_completed(futs), 1):
                     rows.append((futs[fu], fu.result()))
                     bar.progress(k / len(futs))
-            out = pd.DataFrame([r for _, r in sorted(rows, key=lambda z: z[0])], index=old.index)
+            out = pd.DataFrame([r for _, r in sorted(rows, key=lambda z: z[0])], index=old.index).reindex(columns=OUT_COLS)
             st.session_state["track"] = pd.concat([old[["Ticker", "Horizon", "Analysis Date", "Entry", "Stop", "Target"]], out], axis=1)
 
     tr = st.session_state.get("track")
-    if tr is not None and "Return %" in tr:
+    if tr is not None:
+        st.subheader("Status overview")
+        st.write(tr["Status"].value_counts().to_dict())
         done = tr.dropna(subset=["Return %"])
+        if done.empty:
+            st.info("No outcome could be computed yet. Usually this means there is no completed trading session after the "
+                    "'Analysis Date' (weekend, holiday, or the market has not opened/closed yet). Come back after at least a "
+                    "few sessions; a meaningful check needs weeks to months. If you see '❌ Error' rows, Yahoo may have "
+                    "rate-limited you; lower 'Parallel downloads' to 2 and retry.")
         summ = []
         for hz, g in done.groupby("Horizon"):
             tgt_n, stp_n = g["Status"].str.contains("Target").sum(), g["Status"].str.contains("Stop").sum()
