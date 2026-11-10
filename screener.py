@@ -21,6 +21,29 @@ CACHE_DIR = ".screener_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 FORCE = {"v": False}
 
+NIFTY_FILE = "nifty500.csv"
+NIFTY_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+def load_universe():
+    """Reads nifty500.csv (NSE format: Company Name, Industry, Symbol  OR  Ticker, Name, Sector)."""
+    if not os.path.exists(NIFTY_FILE):
+        return None
+    u = pd.read_csv(NIFTY_FILE)
+    cols = {c.lower().strip(): c for c in u.columns}
+    pick = lambda *ks: next((cols[k] for k in ks if k in cols), None)
+    t, n, sc = pick("ticker", "symbol"), pick("name", "company name"), pick("sector", "industry")
+    if t is None:
+        return None
+    out = pd.DataFrame({"Ticker": u[t].astype(str).str.upper().str.strip(),
+                        "Name": u[n] if n else u[t], "Sector": u[sc] if sc else "N/A"})
+    return out.drop_duplicates("Ticker").reset_index(drop=True)
+
+def download_nifty500():
+    r = requests.get(NIFTY_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122 Safari/537.36"})
+    r.raise_for_status()
+    with open(NIFTY_FILE, "wb") as fh:
+        fh.write(r.content)
+
 class RateLimited(Exception):
     pass
 
@@ -132,8 +155,27 @@ st.caption("Business quality + valuation + growth + price trend + ownership, sco
            "Educational tool, not investment advice.")
 
 # ───────────────────────── SIDEBAR ─────────────────────────
-st.sidebar.header("1. Upload tickers")
-ticker_file = st.sidebar.file_uploader("NSE symbols (.txt or .csv)", type=["txt", "csv"])
+st.sidebar.header("1. Stock universe")
+universe = load_universe()
+source = st.sidebar.radio("Source", ["Built-in Nifty 500 file", "Upload my own list"], index=0 if universe is not None else 1)
+ticker_file, sel_sectors = None, []
+if source == "Built-in Nifty 500 file":
+    if universe is None:
+        st.sidebar.warning("nifty500.csv not found. Click the button below to fetch it from NSE.")
+    if st.sidebar.button("⬇️ Download / refresh Nifty 500 list from NSE"):
+        try:
+            download_nifty500()
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Download failed ({str(e)[:60]}). Get it manually from niftyindices.com "
+                             "('Nifty 500' constituents CSV) and save it as nifty500.csv next to this script.")
+    if universe is not None:
+        st.sidebar.caption(f"{len(universe)} stocks loaded. Index changes twice a year (Mar/Sep): refresh then.")
+        sel_sectors = st.sidebar.multiselect("Sectors (empty = all)", sorted(universe["Sector"].dropna().unique()))
+else:
+    ticker_file = st.sidebar.file_uploader("NSE symbols (.txt or .csv)", type=["txt", "csv"])
+max_fresh = st.sidebar.slider("Max NEW stocks fetched per run", 20, 500, 100, 20,
+                              help="Stocks already in the cache are free. Only brand-new fetches count toward this cap.")
 
 st.sidebar.header("2. Valuation assumptions")
 wacc = st.sidebar.slider("Discount rate / WACC (%)", 8.0, 18.0, 12.0, 0.5) / 100
@@ -479,10 +521,14 @@ tab_long, tab_med, tab_short, tab_all, tab_track, tab_guide, tab_logic = st.tabs
     ["🌳 Long Term (3-5y+)", "📈 Medium Term (6-18m)", "⚡ Short Term (1-3m)", "🗂️ All Data",
      "🎯 Track Record", "📖 Guide & Glossary", "🧠 Methodology"])
 
-if ticker_file is None:
-    st.info("👈 Upload your ticker file in the sidebar to begin.")
-else:
+tickers = None
+if source == "Built-in Nifty 500 file" and universe is not None:
+    tickers = (universe[universe["Sector"].isin(sel_sectors)] if sel_sectors else universe)["Ticker"].tolist()
+elif source == "Upload my own list" and ticker_file is not None:
     tickers = load_tickers(ticker_file)
+if not tickers:
+    st.info("👈 Pick a stock universe in the sidebar (download the Nifty 500 list or upload your own) to begin.")
+else:
     st.write(f"📥 Loaded **{len(tickers)}** unique symbols.")
     if st.button("🚀 Analyze & Rank", type="primary"):
         FORCE["v"] = force
@@ -490,7 +536,8 @@ else:
         txt.text("Step 1/2: downloading price history in batches (cached for 12h)...")
         prices = get_prices(tickers, errs)
         todo = [x for x in tickers if x in prices]
-        rl_streak, stopped_at = 0, None
+        todo.sort(key=lambda x: not os.path.exists(_cpath("fund_" + x)))  # cached stocks first (instant)
+        rl_streak, stopped_at, fresh, pending = 0, None, 0, []
         for i, sy in enumerate(todo, 1):
             txt.text(f"Step 2/2: analyzing {i}/{len(todo)}: {sy}")
             bar.progress(i / max(len(todo), 1))
@@ -510,13 +557,20 @@ else:
             out = analyze(sy, prices[sy], fund)
             (errs.__setitem__(sy, out["_err"]) if "_err" in out else res.append(out))
             if not was_cached:
+                fresh += 1
                 time.sleep(delay + random.random())  # polite pause only when we actually hit Yahoo
+                if fresh >= max_fresh:
+                    pending = todo[i:]
+                    break
         if stopped_at:
             for sy in todo[stopped_at - 1:]:
                 errs.setdefault(sy, "Not processed (Yahoo blocked the run)")
             st.warning(f"⛔ Yahoo started blocking after {stopped_at - 1} stocks, so the run stopped safely. "
                        "Everything fetched so far is cached on disk. Wait 15-60 minutes (or switch network), "
                        "then click Analyze again. It resumes from the cache instead of starting over.")
+        if pending:
+            st.info(f"✋ Reached the cap of {max_fresh} new stocks. {len(pending)} stocks are still pending. "
+                    "Click Analyze again later: finished stocks load instantly from cache and the next batch continues.")
         txt.text(f"✅ Done: {len(res)} analyzed, {len(errs)} issues")
         st.session_state["df"], st.session_state["errs"] = pd.DataFrame(res), errs
 
